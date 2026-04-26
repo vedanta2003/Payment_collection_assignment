@@ -998,7 +998,7 @@
             }
 
             // Progress steps — driven purely by state
-            const activeStep = STATE_TO_STEP[state] ? ? 0;
+            const activeStep = STATE_TO_STEP[state] ?? 0;
             const isDone = (state === 'DONE');
             document.querySelectorAll('.step').forEach((el, i) => {
                 if (isDone) {
