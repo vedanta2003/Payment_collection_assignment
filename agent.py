@@ -142,21 +142,31 @@ class Agent:
         )}
 
     def _handle_secondary(self, text: str) -> dict:
-        # Pure digit input → Aadhaar (4) or pincode (6). Everything else → DOB via LLM.
-        # This handles every date format the LLM understands — YYYY-MM-DD, "14 May 1990",
-        # "february 29 1988", etc. — without us maintaining a month-name regex.
+        # Routing logic:
+        # - If text contains any letters → could be a natural-language date
+        #   ("14th may 1990", "february 29 1988") or a date with separators
+        #   ("1990-05-14"). In all cases, ask the LLM to normalize.
+        # - If text is digits-only (possibly with spaces) → Aadhaar (4 digits)
+        #   or pincode (6 digits). Parsed deterministically, no LLM needed.
         dob = aadhaar = pincode = None
-        is_just_digits = text.replace(" ", "").isdigit()
+        has_letters = any(c.isalpha() for c in text)
+        stripped = text.replace(" ", "")
 
-        if is_just_digits:
-            stripped = text.replace(" ", "")
-            aadhaar = parse_aadhaar_last4(stripped)
-            pincode = parse_pincode(stripped)
-        else:
+        if has_letters or not stripped.isdigit():
+            # Date-shaped or ambiguous — ask LLM first, then fall back to digit parsing
             extracted = extract_fields(text, ["dob"], context="Extract date of birth only.")
             raw_dob = extracted.get("dob")
             if raw_dob and validate_dob(raw_dob):
                 dob = raw_dob
+            else:
+                # LLM didn't find a date — try digit parsing anyway
+                # (handles "my aadhaar is 4321" or "pincode: 400001")
+                aadhaar = parse_aadhaar_last4(text)
+                pincode = parse_pincode(text)
+        else:
+            # Pure digits — Aadhaar or pincode
+            aadhaar = parse_aadhaar_last4(stripped)
+            pincode = parse_pincode(stripped)
 
         if not (dob or aadhaar or pincode):
             return {"message": (
