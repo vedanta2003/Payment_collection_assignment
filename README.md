@@ -1,6 +1,6 @@
 # PayAssist — Payment Collection AI Agent
 
-A conversational AI agent for end-to-end payment collection, built with a deterministic state machine and OpenAI GPT-4o-mini for natural language understanding.
+A conversational AI agent that handles end-to-end payment collection over chat. Built as a deterministic state machine in Python, with OpenAI GPT-4o-mini used in one narrowly scoped place: parsing free-form date strings into structured form.
 
 ## Quick Start
 
@@ -11,7 +11,7 @@ pip install -r requirements.txt
 
 ### 2. Set your OpenAI API key
 ```bash
-export OPENAI_API_KEY=your_key_here
+export OPENAI_API_KEY=sk-your-key-here
 ```
 
 ### 3. Run the web UI (recommended)
@@ -20,6 +20,8 @@ python -m uvicorn server:app --reload --port 8000
 ```
 Then open **http://localhost:8000** in your browser.
 
+The web UI includes a live log panel on the right showing the agent's state transitions, API calls, and LLM activity in real time. This is included for assignment review purposes — it's not part of a normal user-facing product.
+
 ### 4. Or run in the terminal
 ```bash
 python cli.py
@@ -27,7 +29,7 @@ python cli.py
 
 ### 5. Run tests
 ```bash
-pytest tests/ -v
+pytest test_agent.py -v
 ```
 
 ---
@@ -36,35 +38,38 @@ pytest tests/ -v
 
 ```
 payment_agent/
-├── agent.py          # Core Agent class — state machine
-├── validators.py     # Pure validation: Luhn, expiry, dates
-├── tools.py          # HTTP calls to Prodigal's API
-├── llm.py            # OpenAI wrapper (NLU + response generation)
-├── server.py         # FastAPI server
+├── agent.py          # Agent class — deterministic state machine
+├── validators.py     # Pure validation: Luhn check, expiry, dates, amounts
+├── tools.py          # HTTP calls to Prodigal's payment API
+├── llm.py            # OpenAI wrapper — extract_fields only
+├── server.py         # FastAPI server + SSE log streaming
 ├── cli.py            # Terminal interface
 ├── static/
-│   └── index.html    # Professional chat UI
-├── tests/
-│   └── test_agent.py # pytest suite
+│   └── index.html    # Web chat UI with live agent log panel
+├── test_agent.py     # pytest suite
+├── DESIGN.md         # Design document
 └── requirements.txt
 ```
 
 ---
 
-## Architecture
+## Architecture (one paragraph)
 
-The agent uses a **hybrid state machine + LLM** approach:
+The state machine in `agent.py` controls everything: which step the conversation is on, when to call the lookup and payment APIs, when verification fails, when retries are exhausted. All business rules live here as plain Python — strict equality for verification, hard retry caps, deterministic transitions.
 
-- **State machine** (Python) — controls the flow, enforces verification logic, counts retries, decides when to call APIs. All business rules are deterministic code.
-- **LLM** (GPT-4o-mini) — used only for two things: (1) extracting structured fields from messy user input, (2) generating natural response text.
+The LLM (`gpt-4o-mini`) is used in exactly one place: `extract_fields` in `llm.py`. It normalizes free-form date strings — `"29 Feb 1988"`, `"December 2027"`, `"14 May 1990"` — into structured form. Plain digit inputs (Aadhaar last 4, pincode, CVV, card numbers, amounts) skip the LLM entirely and are parsed by deterministic validators.
 
-This means verification is always strict (exact match) and auditable, while the agent still handles natural language gracefully.
+See `DESIGN.md` for the full reasoning.
 
 ### States
+
 ```
-GREETING → AWAIT_ACCOUNT_ID → AWAIT_NAME → AWAIT_SECONDARY
-→ AWAIT_AMOUNT → AWAIT_CARD_NUMBER → AWAIT_CVV
-→ AWAIT_EXPIRY → AWAIT_CARDHOLDER → CONFIRM_PAYMENT → DONE
+AWAIT_ACCOUNT_ID → AWAIT_NAME → AWAIT_SECONDARY → AWAIT_AMOUNT
+→ AWAIT_CARD_NUMBER → AWAIT_CVV → AWAIT_EXPIRY → AWAIT_CARDHOLDER
+→ CONFIRM_PAYMENT → DONE
+                    ↓
+        LOCKED / CANCELLED  (terminal)
+        AWAIT_SAME_OR_NEW → AWAIT_SAME_CARD  (repeat-payment flow)
 ```
 
 ---
@@ -74,66 +79,110 @@ GREETING → AWAIT_ACCOUNT_ID → AWAIT_NAME → AWAIT_SECONDARY
 ### 1. Successful payment
 
 ```
-Agent: Welcome to PayAssist. Please share your account ID.
-User:  ACC1001
-Agent: Thank you. Could you please confirm your full name?
-User:  Nithin Jain
-Agent: To verify your identity, please provide your DOB, Aadhaar last 4, or pincode.
-User:  1990-05-14
-Agent: Identity verified. Your outstanding balance is ₹1,250.75. How much would you like to pay?
-User:  500
-Agent: Please enter your card number.
-User:  4532015112830366
-Agent: Please enter your CVV.
-User:  123
-Agent: Please enter your card expiry (e.g. 12 2027).
-User:  12 2027
-Agent: Please enter the cardholder name.
-User:  Nithin Jain
-Agent: I'll process ₹500.00 on your card ending in 0366. Shall I proceed? (yes/no)
-User:  yes
-Agent: Payment of ₹500.00 processed successfully. Transaction ID: txn_1762510325322_l1fl4oy
+Agent:  Welcome to PayAssist. I'm here to help you settle your outstanding
+        balance. To get started, please share your account ID.
+User:   ACC1001
+Agent:  To verify your identity, please share your full name as it appears
+        on the account.
+User:   Nithin Jain
+Agent:  Thanks. Now please provide one of: date of birth (YYYY-MM-DD or
+        e.g. 29 Feb 1988), Aadhaar last 4 digits, or pincode.
+User:   1990-05-14
+Agent:  Identity verified successfully. Your outstanding balance is
+        ₹1250.75. We accept credit or debit cards only. How much would
+        you like to pay today? (up to ₹1250.75)
+User:   500
+Agent:  Please enter your card number.
+User:   4532015112830366
+Agent:  Please enter your CVV.
+User:   123
+Agent:  Please enter your card expiry — month and year (e.g. 12 2027).
+User:   12 2027
+Agent:  Please enter the cardholder name as it appears on the card.
+User:   Nithin Jain
+Agent:  I'll process a payment of ₹500.00 on your card ending in 0366.
+        Shall I proceed? (yes / no)
+User:   yes
+Agent:  Payment of ₹500.00 processed successfully. Your transaction ID
+        is txn_1762510325322_l1fl4oy. Please save this for your records.
+        Would you like to make another payment? (yes / no)
 ```
 
-### 2. Verification failure (exhausts retries)
+### 2. Verification failure (locks after 3 attempts)
 
 ```
-Agent: Welcome to PayAssist. Please share your account ID.
-User:  ACC1001
-Agent: Thank you. Could you please confirm your full name?
-User:  John Doe
-Agent: To verify, please provide your DOB, Aadhaar last 4, or pincode.
-User:  1990-05-14
-Agent: The details don't match. You have 2 attempt(s) remaining.
-User:  John Doe — 1234
-Agent: The details don't match. You have 1 attempt(s) remaining.
-User:  John Doe — 999999
-Agent: We were unable to verify your identity. Session locked. Please contact support.
+Agent:  ...please share your account ID.
+User:   ACC1001
+Agent:  To verify your identity, please share your full name...
+User:   John Doe
+Agent:  That name doesn't match our records. You have 2 attempt(s)
+        remaining. Please share your full name exactly as it appears
+        on the account.
+User:   Wrong Name
+Agent:  That name doesn't match our records. You have 1 attempt(s)
+        remaining. Please share your full name...
+User:   Still Wrong
+Agent:  We were unable to verify your identity after multiple attempts.
+        For security reasons, this session has been locked. Please
+        contact our support team for assistance.
 ```
 
-### 3. Invalid card (retryable)
+### 3. Smart retry — right name, wrong secondary
+
+The agent keeps you on whichever step actually failed. If your name matched but your DOB didn't, you don't have to re-enter your name:
 
 ```
-...verified...
-Agent: Please enter your card number.
-User:  1234123412341234
-Agent: Card number is invalid (failed Luhn check).
-User:  4532015112830366
-Agent: Please enter your CVV.
-...continues normally...
+User:   Nithin Jain
+Agent:  Thanks. Now please provide one of: date of birth, Aadhaar last 4,
+        or pincode.
+User:   9999
+Agent:  That doesn't match our records. You have 2 attempt(s) remaining.
+        Please provide your date of birth, Aadhaar last 4, or pincode.
+User:   4321                ← correct Aadhaar
+Agent:  Identity verified successfully. Your outstanding balance is...
 ```
 
-### 4. Edge case — leap year (ACC1004)
+### 4. Invalid card (retryable up to 3 times)
 
 ```
-User:  ACC1004
-Agent: Could you confirm your full name?
-User:  Rahul Mehta
-Agent: Please provide DOB, Aadhaar last 4, or pincode.
-User:  1988-02-29       ← valid! 1988 is a leap year
-Agent: Identity verified. Your balance is ₹3,200.50.
-User:  1989-02-29       ← if they try this instead
-Agent: I didn't catch that. Please provide DOB as YYYY-MM-DD.
+Agent:  Please enter your card number.
+User:   1234123412341234
+Agent:  I didn't quite catch that. Card number is invalid.
+User:   4532015112830366    ← valid Luhn
+Agent:  Please enter your CVV.
+        ...flow continues normally...
+```
+
+### 5. Leap-year edge case (ACC1004)
+
+ACC1004's DOB is 1988-02-29 — intentionally a leap-year date.
+
+```
+User:   ACC1004
+Agent:  ...please share your full name...
+User:   Rahul Mehta
+Agent:  Thanks. Now please provide one of: date of birth...
+User:   1988-02-29              ← valid (1988 IS a leap year)
+Agent:  Identity verified successfully...
+```
+
+If a user typos `29 Feb 1989` (1989 is not a leap year), the LLM correctly returns null for the date, and the agent responds:
+
+```
+Agent:  I couldn't read that as a valid date or code. Please provide
+        your date of birth (e.g. 1990-05-14 or 14 May 1990), Aadhaar
+        last 4 digits, or 6-digit pincode.
+```
+
+### 6. Natural-language inputs
+
+The LLM handles informal date formats:
+
+```
+User:   14th may 1990          → parsed as 1990-05-14
+User:   December 2027          → expiry parsed as month=12, year=2027
+User:   29 Feb 1988            → parsed as 1988-02-29
+User:   feb 29 1989            → returned as null (invalid date), agent re-prompts
 ```
 
 ---
@@ -146,3 +195,5 @@ Agent: I didn't catch that. Please provide DOB as YYYY-MM-DD.
 | ACC1002 | Rajarajeswari Balasubramaniam | 1985-11-23 | 9876 | 400002 | ₹540.00 |
 | ACC1003 | Priya Agarwal | 1992-08-10 | 2468 | 400003 | ₹0.00 |
 | ACC1004 | Rahul Mehta | 1988-02-29 | 1357 | 400004 | ₹3,200.50 |
+
+ACC1003 has zero balance — the agent recognizes this and exits cleanly without asking for verification.
