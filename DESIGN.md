@@ -127,3 +127,47 @@ After a successful payment (or terminal failure), the agent enters `DONE` and do
 4. **LLM-based evaluator harness** — a second agent simulating different user personas (impatient, confused, adversarial, distracted) running through the flow and scoring responses against rubrics.
 5. **Structured audit logging** — every state transition and API call written to a log store with PII redacted, suitable for compliance review.
 6. **Internationalization** — copy is currently hardcoded English with `₹`. The hardcoded-template choice means moving this to i18n is a clean refactor: extract the inlined strings into a message catalog at the boundary, rather than rewriting the agent.
+
+---
+
+## Evaluation Approach
+
+### Test suite
+
+`test_agent.py` contains 127 tests across 15 categories, runnable with `pytest test_agent.py -v`. The suite runs without any live API calls — all tool and LLM calls are mocked.
+
+| Category | Tests | What's covered |
+|---|---|---|
+| Validator unit tests | 38 | Luhn, expiry, DOB, amount, Aadhaar/pincode parsing — all branches |
+| LLM extraction | 10 | DOB normalization, expiry fallback, deterministic paths that skip the LLM |
+| Full happy-path flows | 9 | Aadhaar, pincode, DOB, partial payment, leap-year account, Amex, Mastercard |
+| Verification failures | 9 | Wrong name, wrong secondary, case sensitivity, lockout, smart retry |
+| Payment failures | 5 | Invalid card/CVV (retryable), expired card, invalid Luhn, zero balance |
+| Account lookup | 4 | Not found, timeout, stored correctly, sensitive data not echoed |
+| Security | 4 | DOB/Aadhaar never echoed, skip-verification blocked, payment unreachable |
+| Edge cases | 8 | Cancel/exit/quit, gibberish input, empty input, decline at confirmation |
+| State machine integrity | 9 | State after every transition, LOCKED/CANCELLED/DONE correctness |
+| Out-of-order name | 5 | Name volunteered with account ID, wrong name no penalty, long names, bare ID no LLM |
+| Card data security | 2 | Card cleared after success and after retryable failure |
+| Card attempt exhaustion | 2 | Three retryable failures → DONE; two failures → still retryable |
+| Natural-language expiry | 3 | Month-name via LLM, numeric via fast-path (LLM not called), garbage input |
+| Terminal state permanence | 3 | LOCKED, DONE, CANCELLED absorb all further input |
+| Non-retryable errors | 3 | `insufficient_balance`, `connection_error` → DONE, never back to card collection |
+
+### What "correct" means per step
+
+**Verification**: correct means exact string equality — `"Nithin Jain"` and `"nithin jain"` must produce different outcomes. The test `test_name_case_sensitive` asserts this directly. Retry counting is correct if `_verify_attempts` increments on every failure and `LOCKED` is reached on the third.
+
+**Tool calling**: correct means the API is called once, at the right moment, with a validated payload. `test_invalid_card_rejected_locally` and `test_expired_card_rejected_locally` verify that the API is never called when local validation fails — if they pass, the validators are acting as a proper gate.
+
+**Failure handling**: correct means retryable errors (invalid card, wrong CVV, invalid expiry) loop back to `AWAIT_CARD_NUMBER` with cleared card data, and non-retryable errors (insufficient balance, connection failure) move to `DONE`. The distinction is tested explicitly in `TestCardAttemptExhaustion` and `TestNonRetryablePaymentErrors`.
+
+**State machine**: correct means every handler is only reachable in the right sequence and terminal states are truly terminal. `TestTerminalStatePermanence` drives multiple inputs into `LOCKED`, `DONE`, and `CANCELLED` to verify they absorb everything cleanly.
+
+### Where the agent struggles
+
+**Ambiguous short inputs at the secondary step.** A 4-digit string like `"1234"` that doesn't match the Aadhaar is treated as a failed Aadhaar attempt, not a possible year fragment. This is correct behavior (and what the tests assert), but a user typing part of a date (`"1990"`) would get an unintuitive failure message. In production, a clarifying prompt ("did you mean a date or an Aadhaar number?") would help.
+
+**Off-script inputs with no digits at the amount step.** "What's the minimum I can pay?" receives the generic validator error ("Please enter a valid number") which is technically correct but feels blunt. Without `smart_reply`, the agent can't distinguish between a malformed number and a genuine question. This is a known tradeoff — see Decision #3.
+
+**LLM date parsing on edge cases.** The agent relies on `gpt-4o-mini` to correctly parse and reject invalid dates (e.g., 29 Feb in a non-leap year). `validate_dob` provides a hard backstop, but if the LLM returns a plausible-looking but wrong date string, the backstop only catches structural invalidity, not semantic incorrectness. Testing this with a live LLM produces the right results; a heavily fine-tuned or quantized model might not.
