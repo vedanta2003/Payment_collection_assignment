@@ -920,3 +920,282 @@ class TestStateMachine:
         agent.next("Nithin Jain")
         agent.next("yes")
         assert agent._state == State.DONE
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 10. OUT-OF-ORDER NAME DETECTION
+# ════════════════════════════════════════════════════════════════════════
+
+class TestOutOfOrder:
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    def test_name_with_account_id_skips_await_name(self, mock_lookup):
+        """User sends name in same message as account ID — agent skips AWAIT_NAME."""
+        from agent import State
+        agent = make_agent()
+        agent.next("")
+        with patch("agent.extract_fields", return_value={"full_name": "Nithin Jain"}):
+            agent.next("ACC1001 Nithin Jain")
+        assert agent._state == State.AWAIT_SECONDARY
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    def test_name_with_account_id_personalised_response(self, mock_lookup):
+        """Response addresses user by name when name is volunteered early."""
+        agent = make_agent()
+        agent.next("")
+        with patch("agent.extract_fields", return_value={"full_name": "Nithin Jain"}):
+            resp = agent.next("ACC1001 Nithin Jain")
+        assert "nithin jain" in resp["message"].lower()
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    def test_wrong_name_with_account_id_falls_through(self, mock_lookup):
+        """Volunteered name that doesn't match falls through to AWAIT_NAME —
+        not counted as a failed verification attempt."""
+        from agent import State
+        agent = make_agent()
+        agent.next("")
+        with patch("agent.extract_fields", return_value={"full_name": "Wrong Person"}):
+            agent.next("ACC1001 Wrong Person")
+        assert agent._state == State.AWAIT_NAME
+        assert agent._verify_attempts == 0  # no penalty for volunteering wrong name
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    def test_bare_account_id_does_not_call_llm(self, mock_lookup):
+        """Bare 'ACC1001' has no residual text — LLM should not be called."""
+        agent = make_agent()
+        agent.next("")
+        with patch("agent.extract_fields") as mock_ef:
+            agent.next("ACC1001")
+        mock_ef.assert_not_called()
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT_LONG_NAME)
+    def test_long_name_volunteered_with_account_id(self, mock_lookup):
+        """Long names (Rajarajeswari Balasubramaniam) are handled correctly."""
+        from agent import State
+        agent = make_agent()
+        agent.next("")
+        with patch("agent.extract_fields",
+                   return_value={"full_name": "Rajarajeswari Balasubramaniam"}):
+            agent.next("ACC1002 Rajarajeswari Balasubramaniam")
+        assert agent._state == State.AWAIT_SECONDARY
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 11. CARD DATA SECURITY
+# ════════════════════════════════════════════════════════════════════════
+
+class TestCardDataSecurity:
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    @patch("tools.process_payment", return_value=MOCK_PAYMENT_SUCCESS)
+    def test_card_cleared_after_successful_payment(self, mock_pay, mock_lookup):
+        """Card data must be wiped from memory after a successful payment."""
+        agent = reach_amount_state()
+        agent.next("500")
+        agent.next(VALID_CARD)
+        agent.next("123")
+        agent.next("12 2027")
+        agent.next("Nithin Jain")
+        agent.next("yes")
+        assert agent._card == {}
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    @patch("tools.process_payment", side_effect=__import__("tools").APIError("invalid_card", "Invalid card."))
+    def test_card_cleared_after_retryable_failure(self, mock_pay, mock_lookup):
+        """Card data is also wiped on a retryable failure before re-collection."""
+        agent = reach_amount_state()
+        agent.next("500")
+        agent.next(VALID_CARD)
+        agent.next("123")
+        agent.next("12 2027")
+        agent.next("Nithin Jain")
+        agent.next("yes")
+        assert agent._card == {}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 12. CARD ATTEMPT EXHAUSTION
+# ════════════════════════════════════════════════════════════════════════
+
+class TestCardAttemptExhaustion:
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    @patch("tools.process_payment", side_effect=__import__("tools").APIError("invalid_card", "The card number is invalid."))
+    def test_three_retryable_failures_ends_session(self, mock_pay, mock_lookup):
+        """Three consecutive retryable card failures should close the session."""
+        from agent import State
+
+        def attempt_payment(agent):
+            agent.next("500")
+            agent.next(VALID_CARD)
+            agent.next("123")
+            agent.next("12 2027")
+            agent.next("Nithin Jain")
+            return agent.next("yes")
+
+        agent = reach_amount_state()
+        for _ in range(3):
+            resp = attempt_payment(agent)
+
+        assert agent._state == State.DONE
+        assert "could not be processed" in resp["message"].lower() or "contact support" in resp["message"].lower()
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    @patch("tools.process_payment", side_effect=__import__("tools").APIError("invalid_card", "Invalid card."))
+    def test_two_failures_then_retry_allowed(self, mock_pay, mock_lookup):
+        """After two retryable failures the agent is still in AWAIT_CARD_NUMBER."""
+        from agent import State
+
+        def attempt_payment(agent):
+            agent.next("500")
+            agent.next(VALID_CARD)
+            agent.next("123")
+            agent.next("12 2027")
+            agent.next("Nithin Jain")
+            agent.next("yes")
+
+        agent = reach_amount_state()
+        attempt_payment(agent)
+        attempt_payment(agent)
+        assert agent._state == State.AWAIT_CARD_NUMBER
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 13. NATURAL LANGUAGE EXPIRY (LLM FALLBACK)
+# ════════════════════════════════════════════════════════════════════════
+
+class TestNaturalLanguageExpiry:
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    @patch("tools.process_payment", return_value=MOCK_PAYMENT_SUCCESS)
+    def test_month_name_expiry(self, mock_pay, mock_lookup):
+        """'dec 2027' should parse correctly via LLM fallback."""
+        agent = reach_amount_state()
+        agent.next("500")
+        agent.next(VALID_CARD)
+        agent.next("123")
+        with patch("agent.extract_fields",
+                   return_value={"expiry_month": 12, "expiry_year": 2027}):
+            resp = agent.next("dec 2027")
+        assert "cardholder" in resp["message"].lower() or "name" in resp["message"].lower()
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    @patch("tools.process_payment", return_value=MOCK_PAYMENT_SUCCESS)
+    def test_numeric_expiry_does_not_call_llm(self, mock_pay, mock_lookup):
+        """'12 2027' should use the regex fast-path, not the LLM."""
+        agent = reach_amount_state()
+        agent.next("500")
+        agent.next(VALID_CARD)
+        agent.next("123")
+        with patch("agent.extract_fields") as mock_ef:
+            resp = agent.next("12 2027")
+        mock_ef.assert_not_called()
+        assert "cardholder" in resp["message"].lower() or "name" in resp["message"].lower()
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    def test_garbage_expiry_rejected(self, mock_lookup):
+        """Unparseable expiry input stays in AWAIT_EXPIRY."""
+        from agent import State
+        agent = reach_amount_state()
+        agent.next("500")
+        agent.next(VALID_CARD)
+        agent.next("123")
+        with patch("agent.extract_fields", return_value={"expiry_month": None, "expiry_year": None}):
+            resp = agent.next("blah blah")
+        assert agent._state == State.AWAIT_EXPIRY
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 14. TERMINAL STATE PERMANENCE
+# ════════════════════════════════════════════════════════════════════════
+
+class TestTerminalStatePermanence:
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    def test_locked_is_permanent(self, mock_lookup):
+        """Any input after LOCKED should return the locked message."""
+        agent = make_agent()
+        agent.next("")
+        agent.next("ACC1001")
+        for _ in range(3):
+            agent.next("Wrong Name")
+            agent.next("0000")
+        for inp in ["hello", "ACC1001", "Nithin Jain", "cancel", ""]:
+            resp = agent.next(inp)
+            assert "locked" in resp["message"].lower() or "security" in resp["message"].lower()
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    @patch("tools.process_payment", return_value=MOCK_PAYMENT_SUCCESS)
+    def test_done_is_permanent(self, mock_pay, mock_lookup):
+        """Any input after DONE should return the session-ended message."""
+        agent = reach_amount_state()
+        agent.next("500")
+        agent.next(VALID_CARD)
+        agent.next("123")
+        agent.next("12 2027")
+        agent.next("Nithin Jain")
+        agent.next("yes")
+        for inp in ["pay again", "yes", "ACC1001", ""]:
+            resp = agent.next(inp)
+            assert "ended" in resp["message"].lower() or "thank you" in resp["message"].lower()
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    def test_cancelled_is_permanent(self, mock_lookup):
+        """Any input after CANCELLED should return the cancel message."""
+        agent = make_agent()
+        agent.next("")
+        agent.next("ACC1001")
+        agent.next("cancel")
+        for inp in ["hello", "ACC1001", "yes"]:
+            resp = agent.next(inp)
+            assert "cancel" in resp["message"].lower() or "session" in resp["message"].lower()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 15. NON-RETRYABLE PAYMENT ERRORS
+# ════════════════════════════════════════════════════════════════════════
+
+class TestNonRetryablePaymentErrors:
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    @patch("tools.process_payment", side_effect=__import__("tools").APIError("insufficient_balance", "Amount exceeds balance."))
+    def test_insufficient_balance_is_terminal(self, mock_pay, mock_lookup):
+        """insufficient_balance is not retryable — session should end."""
+        from agent import State
+        agent = reach_amount_state()
+        agent.next("500")
+        agent.next(VALID_CARD)
+        agent.next("123")
+        agent.next("12 2027")
+        agent.next("Nithin Jain")
+        resp = agent.next("yes")
+        assert agent._state == State.DONE
+        assert "support" in resp["message"].lower() or "could not" in resp["message"].lower()
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    @patch("tools.process_payment", side_effect=__import__("tools").APIError("connection_error", "Could not connect."))
+    def test_connection_error_is_terminal(self, mock_pay, mock_lookup):
+        """connection_error is not retryable — session should end."""
+        from agent import State
+        agent = reach_amount_state()
+        agent.next("500")
+        agent.next(VALID_CARD)
+        agent.next("123")
+        agent.next("12 2027")
+        agent.next("Nithin Jain")
+        resp = agent.next("yes")
+        assert agent._state == State.DONE
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    @patch("tools.process_payment", side_effect=__import__("tools").APIError("insufficient_balance", "Amount exceeds balance."))
+    def test_non_retryable_does_not_go_back_to_card_collection(self, mock_pay, mock_lookup):
+        """After a terminal payment error, agent must NOT loop back to card entry."""
+        from agent import State
+        agent = reach_amount_state()
+        agent.next("500")
+        agent.next(VALID_CARD)
+        agent.next("123")
+        agent.next("12 2027")
+        agent.next("Nithin Jain")
+        agent.next("yes")
+        assert agent._state != State.AWAIT_CARD_NUMBER
