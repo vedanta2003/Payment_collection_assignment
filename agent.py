@@ -24,18 +24,14 @@ class State(Enum):
     DONE                = auto()
     LOCKED              = auto()
     CANCELLED           = auto()
-    AWAIT_SAME_OR_NEW   = auto()
-    AWAIT_SAME_CARD     = auto()
 
 
 MAX_VERIFY_ATTEMPTS = 3
 MAX_CARD_ATTEMPTS   = 3
 
-CANCEL_WORDS  = {"cancel", "exit", "quit", "stop"}
-YES_WORDS     = {"yes", "y", "confirm", "ok", "proceed", "sure", "yep", "yeah"}
-NO_WORDS      = {"no", "n", "cancel", "stop"}
-SAME_WORDS    = {"same", "yes", "y", "this", "that"}
-ANOTHER_WORDS = {"yes", "y", "sure", "another", "more", "again"}
+CANCEL_WORDS = {"cancel", "exit", "quit", "stop"}
+YES_WORDS    = {"yes", "y", "confirm", "ok", "proceed", "sure", "yep", "yeah"}
+NO_WORDS     = {"no", "n", "cancel", "stop"}
 
 GREETING = (
     "Welcome to PayAssist. I'm here to help you settle your outstanding balance. "
@@ -58,7 +54,6 @@ class Agent:
         self._card_attempts   = 0
         self._payment_amount  = None
         self._card            = {}
-        self._reuse_card      = False
 
     # ------------------------------------------------------------------
     def next(self, user_input: str) -> dict:
@@ -90,8 +85,6 @@ class Agent:
             State.AWAIT_CARDHOLDER:  self._handle_cardholder,
             State.CONFIRM_PAYMENT:   self._handle_confirm,
             State.DONE:              self._handle_done,
-            State.AWAIT_SAME_OR_NEW: self._handle_same_or_new,
-            State.AWAIT_SAME_CARD:   self._handle_same_card,
         }[self._state]
         return handler(text)
 
@@ -113,6 +106,24 @@ class Agent:
         if float(data.get("balance", 0)) <= 0:
             self._state = State.DONE
             return {"message": "Your account has a zero balance — there's nothing to pay at this time. Is there anything else I can help you with?"}
+
+        # Out-of-order: did the user volunteer their name in the same message?
+        # Only check if there's text beyond the account ID itself — saves an LLM call
+        # on bare inputs like "ACC1001".
+        residual = text.replace(account_id, "", 1).strip()
+        if len(residual) >= 2:
+            extracted = extract_fields(residual, ["full_name"],
+                                       context="Extract a person's name if present.")
+            volunteered_name = extracted.get("full_name")
+            if volunteered_name and volunteered_name == data["full_name"]:
+                self._state = State.AWAIT_SECONDARY
+                return {"message": (
+                    f"Thanks, {volunteered_name}. Now please provide one of: "
+                    "date of birth (YYYY-MM-DD or e.g. 29 Feb 1988), "
+                    "Aadhaar last 4 digits, or pincode."
+                )}
+            # Volunteered name didn't match (or wasn't found) — fall through to
+            # the standard prompt. We don't count this as a failed attempt.
 
         self._state = State.AWAIT_NAME
         return {"message": "To verify your identity, please share your full name as it appears on the account."}
@@ -200,13 +211,6 @@ class Agent:
         if not ok:
             return {"message": f"{err} Please enter an amount up to ₹{balance:.2f}."}
         self._payment_amount = amount
-        if self._reuse_card and self._card.get("number"):
-            self._reuse_card = False
-            self._state = State.CONFIRM_PAYMENT
-            return {"message": (
-                f"I'll process a payment of ₹{amount:.2f} on your card ending "
-                f"in {self._card['number'][-4:]}. Shall I proceed? (yes / no)"
-            )}
         self._state = State.AWAIT_CARD_NUMBER
         return {"message": "Please enter your card number."}
 
@@ -290,11 +294,13 @@ class Agent:
                 expiry_year     = self._card["expiry_year"],
                 cardholder_name = self._card["cardholder_name"],
             )
+            txn_id = result.get("transaction_id", "")
+            self._card = {}  # clear card data after successful payment
             self._state = State.DONE
             return {"message": (
                 f"Payment of ₹{self._payment_amount:.2f} processed successfully. "
-                f"Your transaction ID is {result.get('transaction_id', '')}. "
-                "Please save this for your records. Would you like to make another payment? (yes / no)"
+                f"Your transaction ID is {txn_id}. Please save this for your records. "
+                "Thank you for using PayAssist."
             )}
         except APIError as e:
             retryable = e.code in {"invalid_card", "invalid_cvv", "invalid_expiry"}
@@ -312,45 +318,6 @@ class Agent:
                 "Please contact support or try again later."
             )}
 
-    # ------------------------------------------------------------------
-    # Repeat-payment flow
-    # ------------------------------------------------------------------
-    def _handle_done(self, text: str) -> dict:
-        t = text.lower()
-        if t in ANOTHER_WORDS:
-            self._state = State.AWAIT_SAME_OR_NEW
-            return {"message": "Would you like to pay with the same account or a different one? (same / new)"}
-        if t in NO_WORDS or t in {"thanks", "thank you", "bye", "goodbye"}:
-            return {"message": "Thank you for using PayAssist. Have a great day!"}
-        return {"message": "Would you like to make another payment? Please reply 'yes' or 'no'."}
-
-    def _handle_same_or_new(self, text: str) -> dict:
-        if text.lower() in SAME_WORDS and self._account_data:
-            self._card_attempts = 0
-            balance = float(self._account_data["balance"])
-            if self._card.get("number"):
-                last4 = self._card["number"][-4:]
-                self._state = State.AWAIT_SAME_CARD
-                return {"message": (
-                    f"Your balance is ₹{balance:.2f}. "
-                    f"Use the same card ending in {last4}, or a different one? (same / new)"
-                )}
-            self._state = State.AWAIT_AMOUNT
-            return {"message": f"Your balance is ₹{balance:.2f}. How much would you like to pay?"}
-
-        # Reset for a fresh account
-        self._account_data = self._account_id = None
-        self._verify_attempts = self._card_attempts = 0
-        self._payment_amount = None
-        self._card = {}
-        self._state = State.AWAIT_ACCOUNT_ID
-        return {"message": "Please share the account ID you'd like to pay for."}
-
-    def _handle_same_card(self, text: str) -> dict:
-        balance = float(self._account_data["balance"])
-        if text.lower() in SAME_WORDS:
-            self._reuse_card = True
-        else:
-            self._card = {}
-        self._state = State.AWAIT_AMOUNT
-        return {"message": f"How much would you like to pay? (up to ₹{balance:.2f})"}
+    def _handle_done(self, _: str) -> dict:
+        # Session is finished. Any further input gets the same closing message.
+        return {"message": "This session has ended. Thank you for using PayAssist."}

@@ -36,11 +36,13 @@ def extract_fields(user_input: str, expected_fields: list[str], context: str = "
     Returns a dict with keys from `expected_fields`.
     Missing fields are None. Never raises — returns empty dict on failure.
 
-    Currently called for two purposes:
+    Currently called for three purposes:
       - DOB normalization: caller has already determined the input is date-shaped
         (contains non-digit characters), and just needs YYYY-MM-DD output.
       - Expiry parsing: caller's regex couldn't match, so the input is likely
         natural language like "december 2027" or "Dec 27".
+      - Out-of-order name: when the user volunteers a full name in the same
+        message as their account ID (e.g. "ACC1001, my name is Nithin Jain").
     """
     fields_desc = ", ".join(expected_fields)
     prompt = f"""Extract the following fields from the user message below.
@@ -53,6 +55,9 @@ Rules:
   for example, 29 Feb in a non-leap year, or month > 12.
 - expiry_month: integer 1-12. Accept month names ("December" → 12, "Jan" → 1).
 - expiry_year: 4-digit integer. Expand 2-digit years ("27" → 2027).
+- full_name: a person's full name as stated, preserving exact casing.
+  Return null if the message contains no name (e.g. just an account ID like
+  "ACC1001"). Do NOT return account IDs, product names, or salutations as names.
 
 {f"Context: {context}" if context else ""}
 
