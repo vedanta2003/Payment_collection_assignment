@@ -70,7 +70,7 @@ def reach_amount_state(mock_lookup_target="tools.lookup_account", account=None):
     """
     Helper context: returns an agent that has completed verification
     and is sitting in AWAIT_AMOUNT state. Uses aadhaar to avoid
-    _looks_like_date interference.
+    date-parsing interference.
     """
     account = account or MOCK_ACCOUNT
     agent = make_agent()
@@ -117,7 +117,6 @@ class TestExtractAccountId:
 
     def test_too_many_digits_partial_match(self):
         from validators import extract_account_id
-        # regex matches first 8 digits — this is correct greedy behavior
         result = extract_account_id("ACC123456789")
         assert result == "ACC12345678"  # matches max 8 digits
 
@@ -153,7 +152,6 @@ class TestValidateDob:
 
     def test_wrong_format_rejected(self):
         from validators import validate_dob
-        # Validator expects YYYY-MM-DD from LLM — not DD-MM-YYYY
         assert validate_dob("14-05-1990") is False
 
 
@@ -334,42 +332,58 @@ class TestValidateAmount:
 
 # ════════════════════════════════════════════════════════════════════════
 # 2. LLM EXTRACTION TESTS
-# Note: We mock extract_fields to test agent behaviour per LLM output.
-# For multi-step tests, we use aadhaar (not DOB) to avoid _looks_like_date
-# interference from the agent's date validation guard.
 # ════════════════════════════════════════════════════════════════════════
 
 class TestLLMExtraction:
 
     @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
     def test_llm_returns_nothing_for_account_id(self, mock_lookup):
-        """When regex and LLM both fail, agent asks again."""
+        """When no ACC pattern found, agent asks again."""
         agent = make_agent()
         agent.next("")
-        with patch("llm.extract_fields", return_value={}):
+        with patch("agent.extract_fields", return_value={}):
             resp = agent.next("I forgot my number")
         assert "acc" in resp["message"].lower() or "account" in resp["message"].lower()
 
     @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
-    def test_llm_extracts_aadhaar_for_verification(self, mock_lookup):
-        """LLM returns aadhaar — agent uses it for verification."""
+    def test_aadhaar_verified_directly(self, mock_lookup):
+        """Aadhaar last 4 is parsed deterministically — no LLM needed.
+        Sending '4321' directly after name should verify successfully."""
         agent = make_agent()
         agent.next("")
         agent.next("ACC1001")
-        with patch("llm.extract_fields", return_value={"aadhaar_last4": "4321"}):
-            agent.next("Nithin Jain")
-            resp = agent.next("my last 4 aadhaar digits are 4321")
+        agent.next("Nithin Jain")
+        resp = agent.next("4321")
         assert "verified" in resp["message"].lower()
 
     @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
-    def test_llm_extracts_pincode_for_verification(self, mock_lookup):
-        """LLM returns pincode — agent uses it for verification."""
+    def test_aadhaar_in_sentence_verified(self, mock_lookup):
+        """Aadhaar embedded in natural text is still parsed deterministically."""
         agent = make_agent()
         agent.next("")
         agent.next("ACC1001")
-        with patch("llm.extract_fields", return_value={"pincode": "400001"}):
-            agent.next("Nithin Jain")
-            resp = agent.next("my pincode is 400001")
+        agent.next("Nithin Jain")
+        resp = agent.next("my last 4 aadhaar digits are 4321")
+        assert "verified" in resp["message"].lower()
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    def test_pincode_verified_directly(self, mock_lookup):
+        """Pincode is parsed deterministically — no LLM needed."""
+        agent = make_agent()
+        agent.next("")
+        agent.next("ACC1001")
+        agent.next("Nithin Jain")
+        resp = agent.next("400001")
+        assert "verified" in resp["message"].lower()
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    def test_pincode_in_sentence_verified(self, mock_lookup):
+        """Pincode embedded in natural text is still parsed deterministically."""
+        agent = make_agent()
+        agent.next("")
+        agent.next("ACC1001")
+        agent.next("Nithin Jain")
+        resp = agent.next("my pincode is 400001")
         assert "verified" in resp["message"].lower()
 
     @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
@@ -379,43 +393,52 @@ class TestLLMExtraction:
         agent.next("")
         agent.next("ACC1001")
         agent.next("Nithin Jain")
-        with patch("llm.extract_fields", return_value={"dob": "1989-02-29"}):
+        with patch("agent.extract_fields", return_value={"dob": "1989-02-29"}):
             resp = agent.next("29 feb 1989")
         msg = resp["message"].lower()
         assert "valid" in msg or "invalid" in msg or "attempt" in msg or "match" in msg
 
     @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
-    def test_llm_extracts_amount(self, mock_lookup):
-        """LLM returns amount — agent moves to card collection."""
+    def test_amount_accepted_directly(self, mock_lookup):
+        """Amount is parsed by validator directly — no LLM needed.
+        Sending '500' should move agent to card collection."""
         agent = reach_amount_state()
-        with patch("llm.extract_fields", return_value={"amount": 500}):
-            resp = agent.next("I want to pay five hundred rupees")
+        resp = agent.next("500")
         assert "card" in resp["message"].lower()
 
     @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
     def test_llm_extracts_amount_exceeding_balance(self, mock_lookup):
         """Validator rejects amount even if LLM extracted it."""
         agent = reach_amount_state()
-        with patch("llm.extract_fields", return_value={"amount": 9999}):
+        with patch("agent.extract_fields", return_value={"amount": 9999}):
             resp = agent.next("pay nine thousand nine hundred rupees")
         assert "balance" in resp["message"].lower() or "valid" in resp["message"].lower()
 
     @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
     @patch("tools.process_payment", return_value=MOCK_PAYMENT_SUCCESS)
-    def test_llm_extracts_card_number(self, mock_pay, mock_lookup):
-        """LLM extracts card number — agent moves to CVV."""
+    def test_card_number_accepted_directly(self, mock_pay, mock_lookup):
+        """Card number is validated by Luhn check directly — no LLM needed.
+        Sending the card number directly should move agent to CVV."""
         agent = reach_amount_state()
         agent.next("500")
-        with patch("llm.extract_fields", return_value={"card_number": VALID_CARD}):
-            resp = agent.next(f"my card is {VALID_CARD}")
+        resp = agent.next(VALID_CARD)
         assert "cvv" in resp["message"].lower()
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    @patch("tools.process_payment", return_value=MOCK_PAYMENT_SUCCESS)
+    def test_dob_via_llm_verification(self, mock_pay, mock_lookup):
+        """DOB is parsed by LLM — mock returns valid date, verification passes."""
+        agent = make_agent()
+        agent.next("")
+        agent.next("ACC1001")
+        agent.next("Nithin Jain")
+        with patch("agent.extract_fields", return_value={"dob": "1990-05-14"}):
+            resp = agent.next("14th may 1990")
+        assert "verified" in resp["message"].lower()
 
 
 # ════════════════════════════════════════════════════════════════════════
 # 3. FULL FLOW TESTS
-# Note: All full flows use aadhaar for secondary factor to avoid
-# _looks_like_date false positives on DOB strings without LLM.
-# DOB-based flows require a live or mocked LLM — tested separately.
 # ════════════════════════════════════════════════════════════════════════
 
 class TestHappyPath:
@@ -448,7 +471,7 @@ class TestHappyPath:
         agent.next("")
         agent.next("ACC1001")
         agent.next("Nithin Jain")
-        with patch("llm.extract_fields", return_value={"dob": "1990-05-14"}):
+        with patch("agent.extract_fields", return_value={"dob": "1990-05-14"}):
             agent.next("1990-05-14")
         agent.next("500")
         agent.next(VALID_CARD)
@@ -548,7 +571,7 @@ class TestVerificationFailure:
         agent.next("")
         agent.next("ACC1001")
         agent.next("Nithin Jain")
-        with patch("llm.extract_fields", return_value={"dob": "1991-01-01"}):
+        with patch("agent.extract_fields", return_value={"dob": "1991-01-01"}):
             resp = agent.next("1991-01-01")
         assert "match" in resp["message"].lower() or "attempt" in resp["message"].lower()
 
@@ -566,7 +589,7 @@ class TestVerificationFailure:
         agent.next("ACC1001")
         for _ in range(3):
             agent.next("Wrong Guy")
-            agent.next("9999")   # wrong aadhaar — no date parsing interference
+            agent.next("9999")   # wrong aadhaar
         final = agent.next("anything")
         assert "locked" in final["message"].lower() or "security" in final["message"].lower()
 
@@ -593,10 +616,12 @@ class TestVerificationFailure:
 
     @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
     def test_only_secondary_asks_for_name(self, mock_lookup):
+        """Sending aadhaar before name: agent is in AWAIT_NAME,
+        treats '4321' as a (failed) name attempt and asks for name."""
         agent = make_agent()
         agent.next("")
         agent.next("ACC1001")
-        resp = agent.next("4321")  # aadhaar only, no name
+        resp = agent.next("4321")
         assert "name" in resp["message"].lower()
 
 
@@ -801,12 +826,14 @@ class TestEdgeCases:
 
     @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
     def test_no_reask_after_account_id(self, mock_lookup):
+        """After account lookup, agent should be in AWAIT_NAME (first verification step)
+        and the account_id should be stored."""
         from agent import State
         agent = make_agent()
         agent.next("")
         agent.next("ACC1001")
         assert agent._account_id == "ACC1001"
-        assert agent._state == State.AWAIT_SECONDARY
+        assert agent._state == State.AWAIT_NAME
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -815,10 +842,11 @@ class TestEdgeCases:
 
 class TestStateMachine:
 
-    def test_initial_state_is_greeting(self):
+    def test_initial_state_is_await_account_id(self):
+        """Agent initialises directly in AWAIT_ACCOUNT_ID — no GREETING state."""
         from agent import State
         agent = make_agent()
-        assert agent._state == State.GREETING
+        assert agent._state == State.AWAIT_ACCOUNT_ID
 
     @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
     def test_state_after_greeting(self, mock_lookup):
@@ -828,11 +856,23 @@ class TestStateMachine:
         assert agent._state == State.AWAIT_ACCOUNT_ID
 
     @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
-    def test_state_after_account_lookup(self, mock_lookup):
+    def test_state_after_account_lookup_is_await_name(self, mock_lookup):
+        """After account lookup, agent is in AWAIT_NAME (name collected first,
+        then secondary factor — two separate states)."""
         from agent import State
         agent = make_agent()
         agent.next("")
         agent.next("ACC1001")
+        assert agent._state == State.AWAIT_NAME
+
+    @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
+    def test_state_after_name_is_await_secondary(self, mock_lookup):
+        """After correct name, agent moves to AWAIT_SECONDARY."""
+        from agent import State
+        agent = make_agent()
+        agent.next("")
+        agent.next("ACC1001")
+        agent.next("Nithin Jain")
         assert agent._state == State.AWAIT_SECONDARY
 
     @patch("tools.lookup_account", return_value=MOCK_ACCOUNT)
