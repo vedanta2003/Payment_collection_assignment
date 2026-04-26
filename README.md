@@ -2,35 +2,87 @@
 
 A conversational AI agent that handles end-to-end payment collection over chat. Built as a deterministic state machine in Python, with OpenAI GPT-4o-mini used in one narrowly scoped place: parsing free-form date strings into structured form.
 
-## Quick Start
+## Setup
 
-### 1. Install dependencies
+### 1. Clone the repo
+
+```bash
+git clone https://github.com/vedanta2003/Payment_collection_assignment.git
+cd Payment_collection_assignment
+```
+
+### 2. Create a virtual environment
+
+Recommended on macOS / modern Linux, where system Python often refuses global `pip install`:
+
+```bash
+python3 -m venv venv
+source venv/bin/activate     # on Windows: venv\Scripts\activate
+```
+
+### 3. Install dependencies
+
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Set your OpenAI API key
+### 4. Set your OpenAI API key
+
+Either export it for the session:
+
 ```bash
 export OPENAI_API_KEY=sk-your-key-here
 ```
 
-### 3. Run the web UI (recommended)
+…or create a `.env` file in the project root with one line:
+
+```
+OPENAI_API_KEY=sk-your-key-here
+```
+
+Both `server.py` and `cli.py` will pick it up.
+
+---
+
+## Running it
+
+### Web UI (recommended)
+
 ```bash
 python -m uvicorn server:app --reload --port 8000
 ```
+
 Then open **http://localhost:8000** in your browser.
 
-The web UI includes a live log panel on the right showing the agent's state transitions, API calls, and LLM activity in real time. This is included for assignment review purposes — it's not part of a normal user-facing product.
+The web UI is the recommended way to interact with the agent for review purposes. The right-hand panel shows a **live agent log** — every state transition, tool call, and LLM extraction streams in as you chat. This makes it easy to see exactly what the agent is doing internally on each turn. (This panel is for demo/review only; it's not part of a production-facing product.)
 
-### 4. Or run in the terminal
+### Terminal CLI (fallback)
+
+If you can't run a local server or just want a quick test:
+
 ```bash
 python cli.py
 ```
 
-### 5. Run tests
+Same agent, no log panel, no UI — just back-and-forth in your terminal. Type `cancel` or hit `Ctrl+C` to exit.
+
+### Tests
+
 ```bash
 pytest test_agent.py -v
 ```
+
+---
+
+## Troubleshooting
+
+**`error: externally-managed-environment` when running `pip install`** — you skipped step 2 (virtual environment). Modern macOS/Linux distributions block global pip installs. Activate the venv first.
+
+**`OPENAI_API_KEY environment variable not set.`** — your key isn't being picked up. Run `echo $OPENAI_API_KEY` to check; if it's empty, re-export it or check that your `.env` file is in the same directory as `server.py`.
+
+**`Address already in use` on port 8000** — another process is using the port. Either kill it (`lsof -ti:8000 | xargs kill`) or run uvicorn on a different port: `--port 8001`.
+
+**Agent says "I'm having trouble connecting to the server right now"** — this means the Prodigal payment API at `se-payment-verification-api.service.external.usea2.aws.prodigaltech.com` is unreachable. Check your internet connection.
 
 ---
 
@@ -43,7 +95,7 @@ payment_agent/
 ├── tools.py          # HTTP calls to Prodigal's payment API
 ├── llm.py            # OpenAI wrapper — extract_fields only
 ├── server.py         # FastAPI server + SSE log streaming
-├── cli.py            # Terminal interface
+├── cli.py            # Terminal interface (fallback)
 ├── static/
 │   └── index.html    # Web chat UI with live agent log panel
 ├── test_agent.py     # pytest suite

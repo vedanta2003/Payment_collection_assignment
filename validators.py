@@ -4,13 +4,11 @@ import re
 from datetime import date
 from typing import Optional
 
-
 # ── Account ID ────────────────────────────────────────────────────────
 
 def extract_account_id(text: str) -> Optional[str]:
     m = re.search(r'ACC\d{3,8}', text.upper())
     return m.group(0) if m else None
-
 
 # ── Date of birth ─────────────────────────────────────────────────────
 
@@ -23,7 +21,6 @@ def validate_dob(dob_str: str) -> bool:
     except (ValueError, AttributeError):
         return False
 
-
 # ── Secondary factors ─────────────────────────────────────────────────
 
 def extract_digits(text: str, length: int) -> Optional[str]:
@@ -33,7 +30,6 @@ def extract_digits(text: str, length: int) -> Optional[str]:
 
 def parse_aadhaar_last4(text: str) -> Optional[str]: return extract_digits(text, 4)
 def parse_pincode(text: str)       -> Optional[str]: return extract_digits(text, 6)
-
 
 # ── Card validation ───────────────────────────────────────────────────
 
